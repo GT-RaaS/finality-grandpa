@@ -46,7 +46,8 @@ use std::{
 use crate::{
 	round::State as RoundState, validate_commit, voter_set::VoterSet, weights::VoteWeight,
 	BlockNumberOps, CatchUp, Chain, Commit, CommitValidationResult, CompactCommit, Equivocation,
-	HistoricalVotes, Message, Precommit, Prevote, PrimaryPropose, SignedMessage, LOG_TARGET,
+	HistoricalVotes, Message, Precommit, Prevote, PrimaryPropose, SignedMessage, VoteTarget,
+	LOG_TARGET,
 };
 use past_rounds::PastRounds;
 use voting_round::{State as VotingRoundState, VotingRound};
@@ -56,14 +57,17 @@ mod voting_round;
 
 /// Necessary environment for a voter.
 ///
-/// This encapsulates the database and networking layers of the chain.
+/// This encapsulates the database and networking layers of the consensus tree.
+/// `H` identifies a block or view-timeout node and `N` is its logical view.
+/// Every parent edge advances `N`, including timeouts; real block heights are
+/// maintained separately by the environment.
 pub trait Environment<H: Eq, N: BlockNumberOps>: Chain<H, N> {
 	/// Associated timer type for the environment. See also [`Self::round_data`] and
 	/// [`Self::round_commit_timer`].
 	type Timer: Future<Output = Result<(), Self::Error>> + Unpin;
 	/// Associated future type for the environment used when asynchronously computing the
 	/// best chain to vote on. See also [`Self::best_chain_containing`].
-	type BestChain: Future<Output = Result<Option<(H, N)>, Self::Error>> + Send + Unpin;
+	type BestChain: Future<Output = Result<Option<VoteTarget<H, N>>, Self::Error>> + Send + Unpin;
 	/// The associated Id for the Environment.
 	type Id: Clone + Eq + Ord + std::fmt::Debug;
 	/// The associated Signature type for the Environment.
@@ -76,18 +80,25 @@ pub trait Environment<H: Eq, N: BlockNumberOps>: Chain<H, N> {
 	/// The associated Error type.
 	type Error: From<crate::Error> + ::std::error::Error;
 
-	/// Return a future that will resolve to the hash of the best block whose chain
-	/// contains the given block hash, even if that block is `base` itself.
+	/// Resolve to the best block or timeout target containing the given consensus
+	/// anchor, even when that target is `base` itself.
 	///
-	/// If `base` is unknown the future outputs `None`.
+	/// Import and validate the target and all its ancestors before returning it;
+	/// [`Chain::vote_target`] must return the exact same kind, identity and view.
+	/// Fork choice must extend both `base` and current finalized consensus history.
+	/// A timeout is a normal `Some(VoteTarget::ViewTimeout(..))`, not `None`.
+	/// While waiting for a block or view deadline, leave this future pending. View
+	/// deadlines must not restart merely because a new GRANDPA round or query starts.
+	/// Return `None` only when `base` is unknown or can no longer be used safely.
 	fn best_chain_containing(&self, base: H) -> Self::BestChain;
 
 	/// Produce data necessary to start a round of voting. This may also be called
 	/// with the round number of the most recently completed round, in which case
 	/// it should yield a valid input stream.
 	///
-	/// The input stream should provide messages which correspond to known blocks
-	/// only.
+	/// The input stream should provide authenticated messages for known consensus
+	/// targets only. Unknown or incorrectly numbered targets are ignored by the
+	/// voter, so the host should fetch/import ancestry before delivering a vote.
 	///
 	/// The voting logic will push unsigned messages over-eagerly into the
 	/// output stream. It is the job of this stream to determine if those messages
@@ -143,9 +154,20 @@ pub trait Environment<H: Eq, N: BlockNumberOps>: Chain<H, N> {
 		votes: &HistoricalVotes<H, N, Self::Signature, Self::Id>,
 	) -> Result<(), Self::Error>;
 
-	/// Called when a block should be finalized.
+	/// Durably finalize a consensus target and project it onto real-block finality.
+	///
+	/// Resolve `(hash, number)` through [`Chain::vote_target`]; `number` is a view,
+	/// and may increase while the real block height remains unchanged. Persist
+	/// finalized timeouts and their ancestors, not only the last real block.
+	/// Finalizing a timeout can also finalize previously unfinalized real ancestors.
+	/// A finalized timeout permanently excludes competing blocks at that view.
+	///
+	/// Apply the consensus checkpoint, real-block projection and proof atomically
+	/// before returning success. On error leave durable and in-memory finality
+	/// unchanged. Signature verification is the host's responsibility; GRANDPA has
+	/// already checked the commit's quorum before invoking this callback.
 	// TODO: make this a future that resolves when it's e.g. written to disk?
-	fn finalize_block(
+	fn finalize_target(
 		&self,
 		hash: H,
 		number: N,
@@ -484,7 +506,7 @@ where
 	voters: VoterSet<E::Id>,
 	inner: Arc<Mutex<InnerVoterState<H, N, E>>>,
 	finalized_notifications: UnboundedReceiver<FinalizedNotification<H, N, E>>,
-	last_finalized_number: N,
+	last_finalized: (H, N),
 	global_in: GlobalIn,
 	global_out: Buffered<GlobalOut, CommunicationOut<H, N, E::Signature, E::Id>>,
 	// the commit protocol might finalize further than the current round (if we're
@@ -542,7 +564,6 @@ where
 		last_finalized: (H, N),
 	) -> Self {
 		let (finalized_sender, finalized_notifications) = mpsc::unbounded();
-		let last_finalized_number = last_finalized.1;
 
 		// re-start the last round and queue all messages to be processed on first poll.
 		// keep it in the background so we can push the estimate backwards until finalized
@@ -590,7 +611,7 @@ where
 			voters,
 			inner,
 			finalized_notifications,
-			last_finalized_number,
+			last_finalized: last_finalized.clone(),
 			last_finalized_in_rounds: last_finalized,
 			global_in,
 			global_out: Buffered::new(global_out),
@@ -619,11 +640,17 @@ where
 			let (f_hash, f_num, round, commit) =
 				res.expect("one sender always kept alive in self.best_round; qed");
 
-			inner.past_rounds.update_finalized(f_num);
-
-			if self.set_last_finalized_number(f_num) {
-				self.env.finalize_block(f_hash.clone(), f_num, round, commit)?;
+			if f_num > self.last_finalized.1 {
+				if !self
+					.env
+					.is_equal_or_descendent_of(self.last_finalized.0.clone(), f_hash.clone())
+				{
+					return Err(crate::Error::NotDescendent.into());
+				}
+				self.env.finalize_target(f_hash.clone(), f_num, round, commit)?;
+				self.last_finalized = (f_hash.clone(), f_num);
 			}
+			inner.past_rounds.update_finalized(f_num);
 
 			if f_num > self.last_finalized_in_rounds.1 {
 				self.last_finalized_in_rounds = (f_hash, f_num);
@@ -653,6 +680,21 @@ where
 						commit.target_hash,
 					);
 
+					// Compact conversion zips votes and authentication data. Validate
+					// lengths and registered views before any entries can be truncated.
+					if commit.precommits.len() != commit.auth_data.len() ||
+						!target_is_known(&*self.env, &commit.target_hash, commit.target_number) ||
+						!commit.precommits.iter().all(|vote| {
+							target_is_known(&*self.env, &vote.target_hash, vote.target_number)
+						}) {
+						process_commit_outcome.run(CommitProcessingOutcome::Bad(BadCommit::from(
+							CommitValidationResult {
+								num_precommits: commit.precommits.len(),
+								..Default::default()
+							},
+						)));
+						continue;
+					}
 					let commit: Commit<_, _, _, _> = commit.into();
 
 					let mut inner = self.inner.lock();
@@ -668,20 +710,27 @@ where
 							// this can't be moved to a function because the compiler
 							// will complain about getting two mutable borrows to self
 							// (due to the call to `self.rounds.get_mut`).
-							let last_finalized_number = &mut self.last_finalized_number;
+							let last_finalized = &mut self.last_finalized;
 
-							// clean up any background rounds
-							inner.past_rounds.update_finalized(commit.target_number);
-
-							if commit.target_number > *last_finalized_number {
-								*last_finalized_number = commit.target_number;
-								self.env.finalize_block(
+							let finalized_number = commit.target_number;
+							if commit.target_number > last_finalized.1 {
+								if !self.env.is_equal_or_descendent_of(
+									last_finalized.0.clone(),
+									commit.target_hash.clone(),
+								) {
+									return Err(crate::Error::NotDescendent.into());
+								}
+								let finalized = (commit.target_hash.clone(), commit.target_number);
+								self.env.finalize_target(
 									commit.target_hash.clone(),
 									commit.target_number,
 									round_number,
 									commit,
 								)?;
+								*last_finalized = finalized;
 							}
+							// Update background rounds only after durable finalization succeeds.
+							inner.past_rounds.update_finalized(finalized_number);
 
 							process_commit_outcome
 								.run(CommitProcessingOutcome::Good(GoodCommit::new()));
@@ -716,7 +765,7 @@ where
 					} else {
 						process_catch_up_outcome
 							.run(CatchUpProcessingOutcome::Bad(BadCatchUp::new()));
-						return Ok(())
+						return Ok(());
 					};
 
 					let state = round.state();
@@ -756,7 +805,11 @@ where
 
 					inner.past_rounds.push(&*self.env, just_completed);
 
-					let old_best = std::mem::replace(&mut inner.best_round, new_best);
+					let mut old_best = std::mem::replace(&mut inner.best_round, new_best);
+					// Unlike ordinary round completion, catch-up may skip a round
+					// that is still querying a target. It must not cast new local
+					// votes after we have adopted the later round's safety state.
+					old_best.stop_voting();
 					inner.past_rounds.push(&*self.env, old_best);
 
 					process_catch_up_outcome
@@ -774,6 +827,7 @@ where
 		// we start a new round at `best_round + 1`.
 		{
 			let mut inner = self.inner.lock();
+			inner.best_round.note_finalized(self.last_finalized.clone());
 
 			let should_start_next = {
 				let completable = match inner.best_round.poll(cx)? {
@@ -789,7 +843,7 @@ where
 			};
 
 			if !should_start_next {
-				return Poll::Pending
+				return Poll::Pending;
 			}
 
 			trace!(
@@ -831,15 +885,17 @@ where
 		inner.past_rounds.push(&*self.env, old_round);
 		Ok(())
 	}
+}
 
-	fn set_last_finalized_number(&mut self, finalized_number: N) -> bool {
-		let last_finalized_number = &mut self.last_finalized_number;
-		if finalized_number > *last_finalized_number {
-			*last_finalized_number = finalized_number;
-			return true
-		}
-		false
-	}
+fn target_is_known<H, N, C>(chain: &C, hash: &H, view: N) -> bool
+where
+	H: Clone + Eq,
+	N: BlockNumberOps,
+	C: Chain<H, N>,
+{
+	chain
+		.vote_target(hash.clone())
+		.is_some_and(|target| target.target() == (hash, view))
 }
 
 impl<H, N, E: Environment<H, N>, GlobalIn, GlobalOut> Future for Voter<H, N, E, GlobalIn, GlobalOut>
@@ -969,7 +1025,24 @@ where
 	if catch_up.round_number <= best_round_number {
 		trace!(target: LOG_TARGET, "Ignoring because best round number is {}", best_round_number);
 
-		return None
+		return None;
+	}
+	if !target_is_known(env, &catch_up.base_hash, catch_up.base_number) ||
+		!catch_up.prevotes.iter().all(|signed| {
+			target_is_known(env, &signed.prevote.target_hash, signed.prevote.target_number) &&
+				env.is_equal_or_descendent_of(
+					catch_up.base_hash.clone(),
+					signed.prevote.target_hash.clone(),
+				)
+		}) || !catch_up.precommits.iter().all(|signed| {
+		target_is_known(env, &signed.precommit.target_hash, signed.precommit.target_number) &&
+			env.is_equal_or_descendent_of(
+				catch_up.base_hash.clone(),
+				signed.precommit.target_hash.clone(),
+			)
+	}) {
+		trace!(target: LOG_TARGET, "Ignoring catch up with invalid target metadata or ancestry");
+		return None;
 	}
 
 	// check threshold support in prevotes and precommits.
@@ -984,7 +1057,7 @@ where
 					prevote.id,
 				);
 
-				return None
+				return None;
 			}
 
 			map.entry(prevote.id.clone()).or_insert((false, false)).0 = true;
@@ -998,7 +1071,7 @@ where
 					precommit.id,
 				);
 
-				return None
+				return None;
 			}
 
 			map.entry(precommit.id.clone()).or_insert((false, false)).1 = true;
@@ -1025,7 +1098,7 @@ where
 		if pv < threshold || pc < threshold {
 			trace!(target: LOG_TARGET, "Ignoring invalid catch up, missing voter threshold");
 
-			return None
+			return None;
 		}
 	}
 
@@ -1046,7 +1119,7 @@ where
 					e,
 				);
 
-				return None
+				return None;
 			},
 		}
 	}
@@ -1062,14 +1135,14 @@ where
 					e,
 				);
 
-				return None
+				return None;
 			},
 		}
 	}
 
 	let state = round.state();
 	if !state.completable {
-		return None
+		return None;
 	}
 
 	Some(round)
@@ -1090,6 +1163,89 @@ mod tests {
 	use futures::{executor::LocalPool, task::SpawnExt};
 	use futures_timer::Delay;
 	use std::{collections::HashSet, iter, time::Duration};
+
+	#[test]
+	fn rejects_compact_commit_length_and_view_mismatches_before_import() {
+		let (network, _routing) = testing::environment::make_network();
+		let env = Arc::new(Environment::new(network, Id(0)));
+		env.with_chain(|chain| chain.push_blocks(GENESIS_HASH, &["A"]));
+		let valid = CompactCommit {
+			target_hash: "A",
+			target_number: 2,
+			precommits: vec![Precommit::new("A", 2)],
+			auth_data: vec![(Signature(0), Id(0))],
+		};
+		let mut unmatched_auth = valid.clone();
+		unmatched_auth.auth_data.clear();
+		let mut forged_view = valid.clone();
+		forged_view.precommits[0].target_number = 99;
+		let mut forged_target = valid;
+		forged_target.target_number = 99;
+		let outcomes = Arc::new(Mutex::new(Vec::new()));
+		let messages = [unmatched_auth, forged_view, forged_target]
+			.into_iter()
+			.map(|commit| {
+				let outcomes = outcomes.clone();
+				Ok(CommunicationIn::Commit(
+					1,
+					commit,
+					Callback::Work(Box::new(move |outcome| outcomes.lock().push(outcome))),
+				))
+			})
+			.collect::<Vec<_>>();
+		let global_out = futures::sink::drain().sink_map_err(|never| match never {});
+		let mut voter = Voter::new(
+			env.clone(),
+			VoterSet::new(vec![(Id(0), 1)]).unwrap(),
+			(futures::stream::iter(messages), global_out),
+			0,
+			Vec::new(),
+			(GENESIS_HASH, 1),
+			(GENESIS_HASH, 1),
+		);
+		let waker = futures::task::noop_waker();
+		voter.process_incoming(&mut Context::from_waker(&waker)).unwrap();
+		assert_eq!(outcomes.lock().len(), 3);
+		assert!(outcomes
+			.lock()
+			.iter()
+			.all(|outcome| matches!(outcome, CommitProcessingOutcome::Bad(_))));
+		assert_eq!(voter.last_finalized, (GENESIS_HASH, 1));
+		assert_eq!(env.with_chain(|chain| chain.last_finalized()), (GENESIS_HASH, 1));
+	}
+
+	#[test]
+	fn rejects_catch_up_unknown_and_forged_base_or_vote_views() {
+		let (network, _routing) = testing::environment::make_network();
+		let env = Environment::new(network, Id(0));
+		env.with_chain(|chain| chain.push_blocks(GENESIS_HASH, &["A"]));
+		let voters = VoterSet::new(vec![(Id(0), 1)]).unwrap();
+		let valid = CatchUp {
+			round_number: 2,
+			base_hash: GENESIS_HASH,
+			base_number: 1,
+			prevotes: vec![crate::SignedPrevote {
+				prevote: Prevote::new("A", 2),
+				signature: Signature(0),
+				id: Id(0),
+			}],
+			precommits: vec![SignedPrecommit {
+				precommit: Precommit::new("A", 2),
+				signature: Signature(0),
+				id: Id(0),
+			}],
+		};
+		assert!(validate_catch_up(valid.clone(), &env, &voters, 1).is_some());
+		let mut forged = valid.clone();
+		forged.base_number = 99;
+		assert!(validate_catch_up(forged, &env, &voters, 1).is_none());
+		let mut forged = valid.clone();
+		forged.prevotes[0].prevote.target_hash = "unknown";
+		assert!(validate_catch_up(forged, &env, &voters, 1).is_none());
+		let mut forged = valid;
+		forged.precommits[0].precommit.target_number = 99;
+		assert!(validate_catch_up(forged, &env, &voters, 1).is_none());
+	}
 
 	#[test]
 	fn talking_to_myself() {
@@ -1656,7 +1812,7 @@ mod tests {
 		// moves backwards.
 		let sender = Id(67);
 		let (_, round_sink) = network.make_round_comms(1, sender);
-		let last_precommit = Message::Precommit(Precommit { target_hash: "D", target_number: 3 });
+		let last_precommit = Message::Precommit(Precommit { target_hash: "D", target_number: 5 });
 		pool.spawner()
 			.spawn(
 				stream::iter(iter::once(Ok(last_precommit)))

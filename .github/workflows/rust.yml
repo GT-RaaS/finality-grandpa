@@ -40,6 +40,16 @@ jobs:
           args: --no-default-features
         env:
           RUSTFLAGS: '-Aunused'
+      - name: Test view protocol and codecs
+        uses: actions-rs/cargo@v1
+        with:
+          command: test
+          args: --all-features
+      - name: Check view protocol (no-std)
+        uses: actions-rs/cargo@v1
+        with:
+          command: check
+          args: --no-default-features --features derive-codec
   rustfmt:
     name: Format
     runs-on: ubuntu-latest

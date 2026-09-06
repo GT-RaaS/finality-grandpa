@@ -68,10 +68,11 @@ where
 	votes: Round<E::Id, H, N, E::Signature>,
 	incoming: E::In,
 	outgoing: Buffered<E::Out, Message<H, N>>,
-	state: Option<State<E::Timer, (H, E::BestChain)>>, // state machine driving votes.
+	state: Option<State<E::Timer, (H, (H, N), E::BestChain)>>, // state machine driving votes.
+	latest_finalized: (H, N), // includes finalized timeout views, not just real blocks.
 	bridged_round_state: Option<crate::bridge_state::PriorView<H, N>>, // updates to later round
 	last_round_state: Option<crate::bridge_state::LatterView<H, N>>, // updates from prior round
-	primary_block: Option<(H, N)>,                     // a block posted by primary as a hint.
+	primary_block: Option<(H, N)>, // a block posted by primary as a hint.
 	finalized_sender: UnboundedSender<FinalizedNotification<H, N, E>>,
 	best_finalized: Option<Commit<H, N, E::Signature, E::Id>>,
 }
@@ -114,6 +115,7 @@ where
 		env: Arc<E>,
 	) -> VotingRound<H, N, E> {
 		let round_data = env.round_data(round_number);
+		let latest_finalized = base.clone();
 		let round_params = crate::round::RoundParams { voters, base, round_number };
 
 		let votes = Round::new(round_params);
@@ -132,6 +134,7 @@ where
 			incoming: round_data.incoming,
 			outgoing: Buffered::new(round_data.outgoing),
 			state: Some(State::Start(round_data.prevote_timer, round_data.precommit_timer)),
+			latest_finalized,
 			bridged_round_state: None,
 			primary_block: None,
 			best_finalized: None,
@@ -151,12 +154,14 @@ where
 	) -> VotingRound<H, N, E> {
 		let round_data = env.round_data(votes.number());
 
+		let latest_finalized = votes.base();
 		VotingRound {
 			votes,
 			voting: Voting::No,
 			incoming: round_data.incoming,
 			outgoing: Buffered::new(round_data.outgoing),
 			state: None,
+			latest_finalized,
 			bridged_round_state: None,
 			primary_block: None,
 			env,
@@ -164,6 +169,23 @@ where
 			finalized_sender,
 			best_finalized: None,
 		}
+	}
+
+	/// Supply the latest target durably finalized by the outer voter.
+	pub(super) fn note_finalized(&mut self, finalized: (H, N)) {
+		if finalized.1 > self.latest_finalized.1 {
+			self.latest_finalized = finalized;
+		}
+	}
+
+	/// Stop creating local votes when a verified catch-up skips this round.
+	///
+	/// Dropping the state also cancels any pending best-chain query or timer.
+	/// Keep the graph, historical votes and network channels so the background
+	/// round can still receive votes and process existing finality proofs.
+	pub(super) fn stop_voting(&mut self) {
+		self.voting = Voting::No;
+		self.state = None;
 	}
 
 	/// Poll the round. When the round is completable and messages have been flushed, it will return `Poll::Ready` but
@@ -199,7 +221,7 @@ where
 
 		// early exit if the current round is not completable
 		if !self.votes.completable() {
-			return Poll::Pending
+			return Poll::Pending;
 		}
 
 		// make sure that the previous round estimate has been finalized
@@ -237,7 +259,7 @@ where
 				self.round_number()
 			);
 			self.log_participation(log::Level::Trace);
-			return Poll::Pending
+			return Poll::Pending;
 		}
 
 		debug!(
@@ -255,7 +277,7 @@ where
 	}
 
 	/// Inspect the state of this round.
-	pub(super) fn state(&self) -> Option<&State<E::Timer, (H, E::BestChain)>> {
+	pub(super) fn state(&self) -> Option<&State<E::Timer, (H, (H, N), E::BestChain)>> {
 		self.state.as_ref()
 	}
 
@@ -316,7 +338,7 @@ where
 		commit: &Commit<H, N, E::Signature, E::Id>,
 	) -> Result<Option<(H, N)>, E::Error> {
 		if !validate_commit(commit, self.voters(), &*self.env)?.is_valid() {
-			return Ok(None)
+			return Ok(None);
 		}
 
 		for SignedPrecommit { precommit, signature, id } in commit.precommits.iter().cloned() {
@@ -370,6 +392,14 @@ where
 		vote: SignedMessage<H, N, E::Signature, E::Id>,
 	) -> Result<(), E::Error> {
 		let SignedMessage { message, signature, id } = vote;
+		if !super::target_is_known(&*self.env, message.target().0, message.target().1) {
+			trace!(
+				target: LOG_TARGET,
+				"Ignoring message for unknown or incorrectly numbered consensus target {:?}",
+				message.target(),
+			);
+			return Ok(());
+		}
 		if !self
 			.env
 			.is_equal_or_descendent_of(self.votes.base().0, message.target().0.clone())
@@ -380,7 +410,7 @@ where
 				message.target(),
 				self.votes.base(),
 			);
-			return Ok(())
+			return Ok(());
 		}
 
 		match message {
@@ -481,7 +511,7 @@ where
 							self.outgoing.push(Message::PrimaryPropose(primary));
 							self.state = Some(State::Proposed(prevote_timer, precommit_timer));
 
-							return Ok(())
+							return Ok(());
 						} else {
 							debug!(
 								target: LOG_TARGET,
@@ -546,7 +576,10 @@ where
 					// state to `Prevoting`.
 					cx.waker().wake_by_ref();
 
-					this.state = Some(State::Prevoting(precommit_timer, (base, best_chain)));
+					this.state = Some(State::Prevoting(
+						precommit_timer,
+						(base, this.latest_finalized.clone(), best_chain),
+					));
 				} else {
 					this.state = Some(State::Prevoted(precommit_timer));
 				}
@@ -562,19 +595,55 @@ where
 		let finish_prevoting = |this: &mut Self,
 		                        precommit_timer: E::Timer,
 		                        base: H,
+		                        observed_finality: (H, N),
 		                        mut best_chain: E::BestChain,
 		                        cx: &mut Context| {
 			let best_chain = match best_chain.poll_unpin(cx) {
 				Poll::Ready(Err(e)) => return Err(e),
 				Poll::Ready(Ok(best_chain)) => best_chain,
 				Poll::Pending => {
-					this.state = Some(State::Prevoting(precommit_timer, (base, best_chain)));
-					return Ok(())
+					this.state = Some(State::Prevoting(
+						precommit_timer,
+						(base, observed_finality, best_chain),
+					));
+					return Ok(());
 				},
 			};
 
 			if let Some(target) = best_chain {
-				let prevote = Prevote { target_hash: target.0, target_number: target.1 };
+				let (target_hash, _) = target.target();
+				if this.env.vote_target(target_hash.clone()).as_ref() != Some(&target) {
+					return Err(crate::Error::InvalidTarget.into());
+				}
+				if !this.env.is_equal_or_descendent_of(base.clone(), target_hash.clone()) {
+					return Err(crate::Error::NotDescendent.into());
+				}
+				if !this
+					.env
+					.is_equal_or_descendent_of(this.latest_finalized.0.clone(), target_hash.clone())
+				{
+					if this.latest_finalized == observed_finality {
+						return Err(crate::Error::NotDescendent.into());
+					}
+					if this.env.is_equal_or_descendent_of(base, this.latest_finalized.0.clone()) {
+						// The host query (possibly including a view timer) completed
+						// using an old fork-choice snapshot. Requery the new finalized
+						// descendant, preserving the initial round's safe anchor.
+						let base = this.latest_finalized.0.clone();
+						let query = this.env.best_chain_containing(base.clone());
+						this.state = Some(State::Prevoting(
+							precommit_timer,
+							(base, this.latest_finalized.clone(), query),
+						));
+						cx.waker().wake_by_ref();
+					} else {
+						this.state = None;
+						this.voting = Voting::No;
+					}
+					return Ok(());
+				}
+				let (target_hash, target_number) = target.into_target();
+				let prevote = Prevote { target_hash, target_number };
 
 				debug!(target: LOG_TARGET, "Casting prevote for round {}", this.votes.number());
 				this.env.prevoted(this.round_number(), prevote.clone())?;
@@ -604,8 +673,8 @@ where
 			Some(State::Proposed(prevote_timer, precommit_timer)) => {
 				start_prevoting(self, prevote_timer, precommit_timer, true, cx)?;
 			},
-			Some(State::Prevoting(precommit_timer, (base, best_chain))) => {
-				finish_prevoting(self, precommit_timer, base, best_chain, cx)?;
+			Some(State::Prevoting(precommit_timer, (base, observed_finality, best_chain))) => {
+				finish_prevoting(self, precommit_timer, base, observed_finality, best_chain, cx)?;
 			},
 			x => {
 				self.state = x;
@@ -716,7 +785,7 @@ where
 								last_round_estimate.0
 							}
 						},
-						Err(crate::Error::NotDescendent) => {
+						Err(_) => {
 							// This is only possible in case of massive equivocation
 							warn!(
 								target: LOG_TARGET,
@@ -785,5 +854,195 @@ where
 				}
 			}
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::{
+		testing::{
+			chain::GENESIS_HASH,
+			environment::{self, Environment as TestEnvironment, Id, Signature},
+		},
+		VoteTarget,
+	};
+	use futures::{channel::mpsc, future};
+
+	type TestRound = VotingRound<&'static str, u32, TestEnvironment>;
+
+	fn round() -> (Arc<TestEnvironment>, TestRound) {
+		let (network, _routing) = environment::make_network();
+		let env = Arc::new(TestEnvironment::new(network, Id(0)));
+		env.with_chain(|chain| chain.push_blocks(GENESIS_HASH, &["A", "B", "C"]));
+		let (sender, _receiver) = mpsc::unbounded();
+		let round = VotingRound::new(
+			1,
+			VoterSet::new(vec![(Id(0), 1)]).unwrap(),
+			(GENESIS_HASH, 1),
+			None,
+			sender,
+			env.clone(),
+		);
+		(env, round)
+	}
+
+	fn set_query(round: &mut TestRound, base: &'static str, target: VoteTarget<&'static str, u32>) {
+		round.state = Some(State::Prevoting(
+			Box::new(future::ready(Ok(()))),
+			(base, (GENESIS_HASH, 1), Box::new(future::ready(Ok(Some(target))))),
+		));
+	}
+
+	#[test]
+	fn local_prevote_rejects_incorrect_target_kind_and_view() {
+		for candidate in [VoteTarget::ViewTimeout("A", 2), VoteTarget::Block("A", 99)] {
+			let (_, mut round) = round();
+			set_query(&mut round, GENESIS_HASH, candidate);
+			let waker = futures::task::noop_waker();
+			let mut cx = Context::from_waker(&waker);
+			assert_eq!(
+				round.prevote(&mut cx, &RoundState::genesis((GENESIS_HASH, 1))),
+				Err(crate::Error::InvalidTarget)
+			);
+			assert!(round.outgoing.buffer.is_empty());
+		}
+	}
+
+	#[test]
+	fn primary_and_votes_ignore_unknown_or_forged_target_pairs() {
+		let (_, mut round) = round();
+		for message in [
+			Message::PrimaryPropose(PrimaryPropose::new("A", 99)),
+			Message::Prevote(Prevote::new("unknown", 99)),
+			Message::Precommit(Precommit::new("A", 99)),
+		] {
+			round
+				.handle_vote(SignedMessage { message, signature: Signature(0), id: Id(0) })
+				.unwrap();
+		}
+		assert_eq!(round.primary_block, None);
+		assert_eq!(round.prevote_weight(), VoteWeight(0));
+		assert_eq!(round.precommit_weight(), VoteWeight(0));
+		round
+			.handle_vote(SignedMessage {
+				message: Message::PrimaryPropose(PrimaryPropose::new("A", 2)),
+				signature: Signature(0),
+				id: Id(0),
+			})
+			.unwrap();
+		assert_eq!(round.primary_block, Some(("A", 2)));
+	}
+
+	#[test]
+	fn delayed_query_restarts_from_new_finality_before_voting() {
+		let (env, mut round) = round();
+		set_query(&mut round, GENESIS_HASH, VoteTarget::Block("B", 3));
+		env.with_chain(|chain| chain.set_last_finalized(("C", 4)));
+		round.note_finalized(("C", 4));
+		let waker = futures::task::noop_waker();
+		let mut cx = Context::from_waker(&waker);
+		let previous = RoundState::genesis((GENESIS_HASH, 1));
+		round.prevote(&mut cx, &previous).unwrap();
+		assert!(round.outgoing.buffer.is_empty());
+		assert!(matches!(round.state(), Some(State::Prevoting(_, ("C", ("C", 4), _)))));
+		round.prevote(&mut cx, &previous).unwrap();
+		assert!(matches!(round.state(), Some(State::Prevoted(_))));
+		assert_eq!(round.outgoing.buffer.pop_front(), Some(Message::Prevote(Prevote::new("C", 4))));
+		round.prevote(&mut cx, &previous).unwrap();
+		assert!(round.outgoing.buffer.is_empty());
+	}
+
+	#[test]
+	fn delayed_query_stops_voting_if_its_anchor_conflicts_with_new_finality() {
+		let (env, mut round) = round();
+		env.with_chain(|chain| chain.push_blocks(GENESIS_HASH, &["X", "Y", "Z"]));
+		set_query(&mut round, "A", VoteTarget::Block("B", 3));
+		round.note_finalized(("Z", 4));
+		let waker = futures::task::noop_waker();
+		let mut cx = Context::from_waker(&waker);
+		round.prevote(&mut cx, &RoundState::genesis((GENESIS_HASH, 1))).unwrap();
+		assert!(round.state().is_none());
+		assert!(!round.voting.is_active());
+		assert!(round.outgoing.buffer.is_empty());
+	}
+
+	#[test]
+	fn catch_up_cancels_the_skipped_rounds_pending_vote() {
+		use crate::{
+			voter::{Callback, CommunicationIn, Voter},
+			CatchUp, SignedPrevote,
+		};
+		use futures::channel::oneshot;
+
+		let (env, _) = round();
+		let (global_sender, global_in) = mpsc::unbounded();
+		let global_out = futures::sink::drain().sink_map_err(|never| match never {});
+		let mut voter = Voter::new(
+			env,
+			VoterSet::new(vec![(Id(0), 1)]).unwrap(),
+			(global_in, global_out),
+			0,
+			Vec::new(),
+			(GENESIS_HASH, 1),
+			(GENESIS_HASH, 1),
+		);
+		let (query_sender, query_receiver) = oneshot::channel::<VoteTarget<&'static str, u32>>();
+		voter.inner.lock().best_round.state = Some(State::Prevoting(
+			Box::new(future::ready(Ok(()))),
+			(
+				GENESIS_HASH,
+				(GENESIS_HASH, 1),
+				Box::new(
+					query_receiver
+						.map(|result| result.map(Some).map_err(|_| crate::Error::InvalidTarget)),
+				),
+			),
+		));
+		global_sender
+			.unbounded_send(Ok(CommunicationIn::CatchUp(
+				CatchUp {
+					round_number: 2,
+					base_hash: GENESIS_HASH,
+					base_number: 1,
+					prevotes: vec![SignedPrevote {
+						prevote: Prevote::new("C", 4),
+						signature: Signature(0),
+						id: Id(0),
+					}],
+					precommits: vec![SignedPrecommit {
+						precommit: Precommit::new("C", 4),
+						signature: Signature(0),
+						id: Id(0),
+					}],
+				},
+				Callback::Blank,
+			)))
+			.unwrap();
+		let waker = futures::task::noop_waker();
+		let mut cx = Context::from_waker(&waker);
+		voter.process_incoming(&mut cx).unwrap();
+		assert!(query_sender.is_canceled());
+		{
+			let inner = voter.inner.lock();
+			assert_eq!(inner.best_round.round_number(), 3);
+			let skipped = inner
+				.past_rounds
+				.voting_rounds()
+				.find(|round| round.round_number() == 1)
+				.unwrap();
+			assert!(skipped.state().is_none());
+			assert!(!skipped.voting.is_active());
+			assert!(skipped.outgoing.buffer.is_empty());
+		}
+		// Actually poll the background round: the dropped query cannot produce
+		// a cached target even though this path does not receive note_finalized.
+		voter.prune_background_rounds(&mut cx).unwrap();
+		let inner = voter.inner.lock();
+		assert!(inner
+			.past_rounds
+			.voting_rounds()
+			.filter(|round| round.round_number() == 1)
+			.all(|skipped| skipped.outgoing.buffer.is_empty()));
 	}
 }

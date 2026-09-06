@@ -18,7 +18,7 @@ use crate::{
 	round::{Round, RoundParams},
 	vote_graph::VoteGraph,
 	voter_set::VoterSet,
-	Chain, Error, Precommit, Prevote,
+	Chain, Error, Precommit, Prevote, VoteTarget,
 };
 
 #[cfg(not(feature = "std"))]
@@ -90,6 +90,13 @@ impl FuzzChain {
 }
 
 impl Chain<Hash, BlockNumber> for FuzzChain {
+	fn vote_target(&self, hash: Hash) -> Option<VoteTarget<Hash, BlockNumber>> {
+		match hash {
+			0..=15 => Some(VoteTarget::Block(hash, Self::number(hash))),
+			_ => None,
+		}
+	}
+
 	fn ancestry(&self, base: Hash, block: Hash) -> Result<Vec<Hash>, Error> {
 		// filter out bad descendents.
 		match (base, block) {
@@ -534,6 +541,33 @@ pub fn execute_fuzzed_graph(data: &[u8]) {
 
 #[cfg(test)]
 mod tests {
+	#[test]
+	fn fuzz_chain_vote_targets_have_exact_known_heights() {
+		use crate::{Chain, VoteTarget};
+		for (hash, view) in [
+			(0, 0),
+			(1, 1),
+			(2, 1),
+			(3, 1),
+			(4, 2),
+			(5, 2),
+			(6, 2),
+			(7, 2),
+			(8, 2),
+			(9, 2),
+			(10, 3),
+			(11, 3),
+			(12, 3),
+			(13, 3),
+			(14, 3),
+			(15, 3),
+		] {
+			assert_eq!(super::FuzzChain.vote_target(hash), Some(VoteTarget::Block(hash, view)));
+		}
+		assert_eq!(super::FuzzChain.vote_target(16), None);
+		assert_eq!(super::FuzzChain.vote_target(u8::MAX), None);
+	}
+
 	#[test]
 	fn be9e58ec5a0d4dce97bd1f07a3d1ffddd7d4b48b() {
 		let data = include_bytes!("../fuzz_corpus/be9e58ec5a0d4dce97bd1f07a3d1ffddd7d4b48b");

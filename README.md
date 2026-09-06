@@ -63,6 +63,28 @@ The trait exposes callbacks for the full lifecycle of a round:
 
 As well as callbacks for notifying about block finality and voter misbehavior (equivocations).
 
+### Block and view-timeout targets
+
+The voter directly accepts `VoteTarget::Block` and `VoteTarget::ViewTimeout` from
+`Environment::best_chain_containing`. Instantiate the core over `(view::TargetId, view::View)`:
+both target kinds advance the consensus view by one; only blocks advance the real block number.
+`Chain::vote_target` supplies authenticated metadata and `Environment::finalize_target` persists
+consensus finality, including timeout-only progress. There is no feature gate or adapter layer.
+
+This changes the `Chain` and `Environment` interfaces and is not wire-compatible with block-only
+networks. The host still provides block/header validation, timeout admission, signatures,
+networking, fork choice and storage. See [the integration guide](docs/view-consensus.md).
+
+The library defines target data and consumes the host's `Chain` implementation; it does not
+provide an in-memory target store. The mock chain is defined only in the test module.
+
+```sh
+cargo test --all-features
+cargo check --no-default-features
+```
+
+For encoded core votes/commits/catch-ups additionally enable `derive-codec`.
+
 ### Substrate
 
 The main user of this crate is [Substrate][substrate] and should be the main resource used to look

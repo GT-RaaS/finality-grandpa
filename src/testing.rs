@@ -14,10 +14,14 @@
 
 //! Helpers for testing
 
+pub(crate) mod view_chain;
+#[cfg(feature = "std")]
+mod view_targets;
+
 pub mod chain {
 	use crate::{
 		std::{collections::BTreeMap, vec::Vec},
-		Chain, Error,
+		Chain, Error, VoteTarget,
 	};
 
 	pub const GENESIS_HASH: &str = "genesis";
@@ -109,6 +113,10 @@ pub mod chain {
 	}
 
 	impl Chain<&'static str, u32> for DummyChain {
+		fn vote_target(&self, hash: &'static str) -> Option<VoteTarget<&'static str, u32>> {
+			self.inner.get(hash).map(|record| VoteTarget::Block(hash, record.number))
+		}
+
 		fn ancestry(
 			&self,
 			base: &'static str,
@@ -146,7 +154,7 @@ pub mod environment {
 		round::State as RoundState,
 		voter::{Callback, CommunicationIn, CommunicationOut, RoundData},
 		Chain, Commit, Equivocation, Error, HistoricalVotes, Message, Precommit, Prevote,
-		PrimaryPropose, SignedMessage,
+		PrimaryPropose, SignedMessage, VoteTarget,
 	};
 	use futures::{
 		channel::mpsc::{self, UnboundedReceiver, UnboundedSender},
@@ -213,6 +221,10 @@ pub mod environment {
 	}
 
 	impl Chain<&'static str, u32> for Environment {
+		fn vote_target(&self, hash: &'static str) -> Option<VoteTarget<&'static str, u32>> {
+			self.chain.lock().vote_target(hash)
+		}
+
 		fn ancestry(
 			&self,
 			base: &'static str,
@@ -224,8 +236,11 @@ pub mod environment {
 
 	impl crate::voter::Environment<&'static str, u32> for Environment {
 		type Timer = Box<dyn Future<Output = Result<(), Error>> + Unpin + Send>;
-		type BestChain =
-			Box<dyn Future<Output = Result<Option<(&'static str, u32)>, Error>> + Unpin + Send>;
+		type BestChain = Box<
+			dyn Future<Output = Result<Option<VoteTarget<&'static str, u32>>, Error>>
+				+ Unpin
+				+ Send,
+		>;
 		type Id = Id;
 		type Signature = Signature;
 		type In = Box<
@@ -237,7 +252,12 @@ pub mod environment {
 		type Error = Error;
 
 		fn best_chain_containing(&self, base: &'static str) -> Self::BestChain {
-			Box::new(future::ok(self.chain.lock().best_chain_containing(base)))
+			Box::new(future::ok(
+				self.chain
+					.lock()
+					.best_chain_containing(base)
+					.map(|(hash, number)| VoteTarget::Block(hash, number)),
+			))
 		}
 
 		fn round_data(&self, round: u64) -> RoundData<Self::Id, Self::Timer, Self::In, Self::Out> {
@@ -285,7 +305,7 @@ pub mod environment {
 			Ok(())
 		}
 
-		fn finalize_block(
+		fn finalize_target(
 			&self,
 			hash: &'static str,
 			number: u32,

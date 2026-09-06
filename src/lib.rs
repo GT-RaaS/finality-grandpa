@@ -35,6 +35,7 @@ extern crate alloc;
 extern crate std;
 
 pub mod round;
+pub mod view;
 pub mod vote_graph;
 #[cfg(feature = "std")]
 pub mod voter;
@@ -81,13 +82,48 @@ use scale_info::TypeInfo;
 // Overarching log target
 const LOG_TARGET: &str = "grandpa";
 
-/// A prevote for a block and its ancestors.
+/// A known consensus target returned by fork choice.
+///
+/// Both variants identify a node in the same ancestry tree. `H` is the consensus
+/// target identity and `N` is its view, not the real block number. The complete
+/// block/timeout payload and its parent are stored in [`view::ConsensusTarget`].
+/// A timeout has its own identity; it must not reuse the preceding block hash.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "derive-codec", derive(Encode, Decode, DecodeWithMemTracking, TypeInfo))]
+pub enum VoteTarget<H, N> {
+	/// A block target and its view. Its real block number advances by one.
+	#[cfg_attr(feature = "derive-codec", codec(index = 0))]
+	Block(H, N),
+	/// A timeout target and its view. Its real block projection stays unchanged.
+	#[cfg_attr(feature = "derive-codec", codec(index = 1))]
+	ViewTimeout(H, N),
+}
+
+impl<H, N> VoteTarget<H, N> {
+	/// Consume the candidate and return its identity and consensus view.
+	pub fn into_target(self) -> (H, N) {
+		match self {
+			Self::Block(hash, view) | Self::ViewTimeout(hash, view) => (hash, view),
+		}
+	}
+}
+
+impl<H, N: Copy> VoteTarget<H, N> {
+	/// Borrow the identity and read the consensus view.
+	pub fn target(&self) -> (&H, N) {
+		match self {
+			Self::Block(hash, view) | Self::ViewTimeout(hash, view) => (hash, *view),
+		}
+	}
+}
+
+/// A prevote for a consensus target and its ancestors, including timeouts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "derive-codec", derive(Encode, Decode, DecodeWithMemTracking, TypeInfo))]
 pub struct Prevote<H, N> {
-	/// The target block's hash.
+	/// The consensus target identity, committing to its kind, parent and payload.
 	pub target_hash: H,
-	/// The target block's number.
+	/// The consensus view, which increases even when no real block is produced.
 	pub target_number: N,
 }
 
@@ -98,13 +134,13 @@ impl<H, N> Prevote<H, N> {
 	}
 }
 
-/// A precommit for a block and its ancestors.
+/// A precommit for a consensus target and its ancestors, including timeouts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "derive-codec", derive(Encode, Decode, DecodeWithMemTracking, TypeInfo))]
 pub struct Precommit<H, N> {
-	/// The target block's hash.
+	/// The consensus target identity, not the latest real block hash.
 	pub target_hash: H,
-	/// The target block's number
+	/// The consensus view, not the real block number.
 	pub target_number: N,
 }
 
@@ -134,11 +170,12 @@ impl<H, N> PrimaryPropose<H, N> {
 }
 
 /// Top-level error type used by this crate.
-#[derive(Clone, PartialEq)]
-#[cfg_attr(any(feature = "std", test), derive(Debug))]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Error {
 	/// The block is not a descendent of the given base block.
 	NotDescendent,
+	/// A target identity is unknown or inconsistent with its advertised view.
+	InvalidTarget,
 }
 
 #[cfg(feature = "std")]
@@ -146,6 +183,7 @@ impl std::fmt::Display for Error {
 	fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
 		match *self {
 			Error::NotDescendent => write!(f, "Block not descendent of base"),
+			Error::InvalidTarget => write!(f, "Unknown or inconsistent consensus target"),
 		}
 	}
 }
@@ -155,6 +193,7 @@ impl std::error::Error for Error {
 	fn description(&self) -> &str {
 		match *self {
 			Error::NotDescendent => "Block not descendent of base",
+			Error::InvalidTarget => "Unknown or inconsistent consensus target",
 		}
 	}
 }
@@ -185,6 +224,18 @@ where
 
 /// Chain context necessary for implementation of the finality gadget.
 pub trait Chain<H: Eq, N: Copy + BlockNumberOps> {
+	/// Look up a known, validated target's kind, identity and consensus view.
+	///
+	/// Unknown targets must return `None`. Stored ancestry includes both blocks
+	/// and timeouts; every edge increases the view by one. The real block number
+	/// is payload data and must not be used as the view.
+	fn vote_target(&self, hash: H) -> Option<VoteTarget<H, N>>;
+
+	/// Check a vote's advertised view against the stored target metadata.
+	fn is_valid_target(&self, hash: H, view: N) -> bool {
+		self.vote_target(hash).is_some_and(|target| target.into_target().1 == view)
+	}
+
 	/// Get the ancestry of a block up to but not including the base hash.
 	/// Should be in reverse order from `block`'s parent.
 	///
@@ -194,15 +245,9 @@ pub trait Chain<H: Eq, N: Copy + BlockNumberOps> {
 	/// Returns true if `block` is a descendent of or equal to the given `base`.
 	fn is_equal_or_descendent_of(&self, base: H, block: H) -> bool {
 		if base == block {
-			return true
-		}
-
-		// TODO: currently this function always succeeds since the only error
-		// variant is `Error::NotDescendent`, this may change in the future as
-		// other errors (e.g. IO) are not being exposed.
-		match self.ancestry(base, block) {
-			Ok(_) => true,
-			Err(Error::NotDescendent) => false,
+			self.vote_target(base).is_some()
+		} else {
+			self.ancestry(base, block).is_ok()
 		}
 	}
 }
@@ -459,6 +504,18 @@ where
 		})
 		.collect::<Vec<_>>();
 
+	// Target IDs authenticate the complete block/timeout event. Never let a
+	// forged view create a different graph height for the same stored target.
+	if !chain.is_valid_target(commit.target_hash.clone(), commit.target_number) ||
+		valid_precommits.iter().any(|signed| {
+			!chain.is_valid_target(
+				signed.precommit.target_hash.clone(),
+				signed.precommit.target_number,
+			)
+		}) {
+		return Ok(validation_result)
+	}
+
 	// the base of the round should be the lowest block for which we can find a
 	// precommit (any vote would only have been accepted if it was targetting a
 	// block higher or equal to the round base)
@@ -623,7 +680,7 @@ mod tests {
 	#[test]
 	fn commit_validation() {
 		let mut chain = DummyChain::new();
-		chain.push_blocks(GENESIS_HASH, &["A"]);
+		chain.push_blocks(GENESIS_HASH, &["A", "B", "C"]);
 
 		let voters = VoterSet::new((1..=100).map(|id| (id, 1))).unwrap();
 
@@ -635,14 +692,14 @@ mod tests {
 
 		let mut precommits = Vec::new();
 		for id in 1..67 {
-			let precommit = make_precommit("C", 3, id);
+			let precommit = make_precommit("C", 4, id);
 			precommits.push(precommit);
 		}
 
 		// we have still not reached threshold with 66/100 votes, so the commit
 		// is not valid.
 		let result = validate_commit(
-			&Commit { target_hash: "C", target_number: 3, precommits: precommits.clone() },
+			&Commit { target_hash: "C", target_number: 4, precommits: precommits.clone() },
 			&voters,
 			&chain,
 		)
@@ -652,10 +709,10 @@ mod tests {
 
 		// after adding one more commit targetting the same block we are over
 		// the finalization threshold and the commit should be valid
-		precommits.push(make_precommit("C", 3, 67));
+		precommits.push(make_precommit("C", 4, 67));
 
 		let result = validate_commit(
-			&Commit { target_hash: "C", target_number: 3, precommits: precommits.clone() },
+			&Commit { target_hash: "C", target_number: 4, precommits: precommits.clone() },
 			&voters,
 			&chain,
 		)
@@ -666,7 +723,7 @@ mod tests {
 		// the commit target must be the exact same as the round precommit ghost
 		// that is calculated with the given precommits for the commit to be valid
 		let result = validate_commit(
-			&Commit { target_hash: "B", target_number: 2, precommits: precommits.clone() },
+			&Commit { target_hash: "B", target_number: 3, precommits: precommits.clone() },
 			&voters,
 			&chain,
 		)
@@ -691,20 +748,20 @@ mod tests {
 		// we add 66/100 precommits targeting block C
 		let mut precommits = Vec::new();
 		for id in 1..67 {
-			let precommit = make_precommit("C", 3, id);
+			let precommit = make_precommit("C", 4, id);
 			precommits.push(precommit);
 		}
 
 		// we then add two equivocated votes targeting A and B
 		// from the 67th validator
-		precommits.push(make_precommit("A", 1, 67));
-		precommits.push(make_precommit("B", 2, 67));
+		precommits.push(make_precommit("A", 2, 67));
+		precommits.push(make_precommit("B", 3, 67));
 
 		// this equivocation is treated as "voting for all blocks", which means
 		// that block C will now have 67/100 votes and therefore it can be
 		// finalized.
 		let result = validate_commit(
-			&Commit { target_hash: "C", target_number: 3, precommits: precommits.clone() },
+			&Commit { target_hash: "C", target_number: 4, precommits: precommits.clone() },
 			&voters,
 			&chain,
 		)
@@ -733,12 +790,12 @@ mod tests {
 		precommits.push(make_precommit("Z", 1, 1000));
 
 		for id in 1..=67 {
-			let precommit = make_precommit("C", 3, id);
+			let precommit = make_precommit("C", 4, id);
 			precommits.push(precommit);
 		}
 
 		let result = validate_commit(
-			&Commit { target_hash: "C", target_number: 3, precommits: precommits.clone() },
+			&Commit { target_hash: "C", target_number: 4, precommits: precommits.clone() },
 			&voters,
 			&chain,
 		)

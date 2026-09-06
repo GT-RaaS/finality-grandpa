@@ -270,6 +270,15 @@ where
 			None => return Ok(import_result),
 		};
 
+		// Validate before recording the vote, including before equivocation
+		// accounting: an ID must have exactly one view in the consensus tree.
+		if !chain.is_valid_target(prevote.target_hash.clone(), prevote.target_number) {
+			return Err(crate::Error::InvalidTarget)
+		}
+		if !chain.is_equal_or_descendent_of(self.base().0, prevote.target_hash.clone()) {
+			return Err(crate::Error::NotDescendent)
+		}
+
 		import_result.valid_voter = true;
 		let weight = info.weight();
 
@@ -355,6 +364,12 @@ where
 			Some(info) => info.clone(),
 			None => return Ok(import_result),
 		};
+		if !chain.is_valid_target(precommit.target_hash.clone(), precommit.target_number) {
+			return Err(crate::Error::InvalidTarget)
+		}
+		if !chain.is_equal_or_descendent_of(self.base().0, precommit.target_hash.clone()) {
+			return Err(crate::Error::NotDescendent)
+		}
 		import_result.valid_voter = true;
 		let weight = info.weight();
 
@@ -865,7 +880,7 @@ mod tests {
 			.unwrap();
 
 		round
-			.import_prevote(&chain, Prevote::new("EC", 10), "Alice", Signature("Alice"))
+			.import_prevote(&chain, Prevote::new("EC", 9), "Alice", Signature("Alice"))
 			.unwrap();
 
 		round.set_precommitted_index();
@@ -893,7 +908,7 @@ mod tests {
 						id: "Eve"
 					},
 					SignedMessage {
-						message: Message::Prevote(Prevote { target_hash: "EC", target_number: 10 }),
+						message: Message::Prevote(Prevote { target_hash: "EC", target_number: 9 }),
 						signature: Signature("Alice"),
 						id: "Alice"
 					},
