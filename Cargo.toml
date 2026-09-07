@@ -1,10 +1,10 @@
 [package]
-name = "finality-grandpa"
+name = "finality-grandpa-view"
 version = "0.16.3"
 description = "PBFT-based finality gadget for blockchains"
 authors = ["Parity Technologies <admin@parity.io>"]
 license = "Apache-2.0"
-repository = "https://github.com/paritytech/finality-grandpa"
+repository = "https://github.com/GT-RaaS/finality-grandpa"
 edition = "2021"
 
 [dependencies]
