@@ -121,7 +121,7 @@ impl<H, N: Copy> VoteTarget<H, N> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "derive-codec", derive(Encode, Decode, DecodeWithMemTracking, TypeInfo))]
 pub struct Prevote<H, N> {
-	/// The consensus target identity, committing to its kind, parent and payload.
+	/// The application-provided consensus target identity.
 	pub target_hash: H,
 	/// The consensus view, which increases even when no real block is produced.
 	pub target_number: N,
@@ -504,8 +504,8 @@ where
 		})
 		.collect::<Vec<_>>();
 
-	// Target IDs authenticate the complete block/timeout event. Never let a
-	// forged view create a different graph height for the same stored target.
+	// Check host-provided target metadata. Never let a forged view create a
+	// different graph height for the same stored target.
 	if !chain.is_valid_target(commit.target_hash.clone(), commit.target_number) ||
 		valid_precommits.iter().any(|signed| {
 			!chain.is_valid_target(

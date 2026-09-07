@@ -3,16 +3,15 @@
 
 //! Exercise the existing GRANDPA graph, rounds and proofs with mixed view targets.
 
-use super::view_chain::ViewChain;
+use super::view_chain::{ConsensusTarget, TargetId, TargetRef, ViewChain};
 use crate::{
 	round::{Round, RoundParams},
 	validate_commit,
-	view::{BlockRef, ConsensusTarget, TargetId, TargetKind, TargetRef},
+	view::{BlockRef, TargetKind},
 	voter_set::VoterSet,
 	Chain, Commit, Precommit, Prevote, SignedPrecommit,
 };
 
-const DOMAIN: [u8; 32] = [42; 32];
 type TestChain = ViewChain<[u8; 32], u64>;
 type TestRound = Round<u64, TargetId, u64, u64>;
 
@@ -21,7 +20,7 @@ fn block(number: u64, tag: u8) -> BlockRef<[u8; 32], u64> {
 }
 
 fn chain() -> TestChain {
-	TestChain::new(DOMAIN, 10, block(100, 0))
+	TestChain::new(10, block(100, 0))
 }
 
 fn voters() -> VoterSet<u64> {
@@ -251,7 +250,7 @@ fn round_rejects_unknown_or_forged_views_without_consuming_the_voters_vote() {
 	let timeout = append_timeout(&mut chain, root);
 	let mut round = round(root);
 	for invalid in [
-		TargetRef { id: TargetId([99; 32]), view: timeout.view },
+		TargetRef { id: 99, view: timeout.view },
 		TargetRef { id: timeout.id, view: timeout.view + 1 },
 	] {
 		assert!(matches!(
@@ -324,11 +323,11 @@ fn commit_validation_rejects_forged_views_but_ignores_nonvoter_metadata() {
 	let mut wrong_commit_view = valid.clone();
 	wrong_commit_view.target_number += 1;
 	let mut unknown_commit = valid.clone();
-	unknown_commit.target_hash = TargetId([99; 32]);
+	unknown_commit.target_hash = 99;
 	let mut wrong_vote_view = valid.clone();
 	wrong_vote_view.precommits[0].precommit.target_number += 1;
 	let mut unknown_vote = valid.clone();
-	unknown_vote.precommits[0].precommit.target_hash = TargetId([99; 32]);
+	unknown_vote.precommits[0].precommit.target_hash = 99;
 	let mut forged_height_everywhere = valid.clone();
 	forged_height_everywhere.target_number += 100;
 	for signed in &mut forged_height_everywhere.precommits {
@@ -343,7 +342,7 @@ fn commit_validation_rejects_forged_views_but_ignores_nonvoter_metadata() {
 	let mut with_nonvoter = valid;
 	with_nonvoter
 		.precommits
-		.push(signed_precommit(TargetRef { id: TargetId([99; 32]), view: u64::MAX }, 99));
+		.push(signed_precommit(TargetRef { id: 99, view: u64::MAX }, 99));
 	let validation = validate_commit(&with_nonvoter, &voters(), &chain).unwrap();
 	assert!(validation.is_valid());
 	assert_eq!(validation.num_invalid_voters(), 1);
@@ -655,13 +654,14 @@ mod end_to_end {
 		let chain = chain();
 		let root = chain.root();
 		let first_block = chain.block(root.id, block(101, 1)).unwrap();
-		let block_ref = TargetRef { id: first_block.id(&DOMAIN), view: first_block.view };
+		let mut expected_chain = chain.clone();
+		let block_ref = expected_chain.import(first_block.clone()).unwrap();
 		let timeout = ConsensusTarget {
 			parent: Some(block_ref.id),
 			view: block_ref.view + 1,
 			kind: TargetKind::ViewTimeout,
 		};
-		let timeout_ref = TargetRef { id: timeout.id(&DOMAIN), view: timeout.view };
+		let timeout_ref = expected_chain.import(timeout.clone()).unwrap();
 		let host = Arc::new(Host {
 			chain: Mutex::new(chain),
 			candidates: Mutex::new(VecDeque::from(vec![first_block, timeout])),
@@ -750,7 +750,7 @@ mod end_to_end {
 		let chain = chain();
 		let root = chain.root();
 		let candidate = chain.block(root.id, block(101, 1)).unwrap();
-		let candidate_ref = TargetRef { id: candidate.id(&DOMAIN), view: candidate.view };
+		let candidate_ref = chain.clone().import(candidate.clone()).unwrap();
 		let host = Arc::new(Host {
 			chain: Mutex::new(chain),
 			candidates: Mutex::new(VecDeque::from(vec![candidate])),

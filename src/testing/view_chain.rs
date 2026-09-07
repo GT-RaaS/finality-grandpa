@@ -2,15 +2,20 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! In-memory block/timeout chain used only by tests.
+//! IDs are sequential fixture keys, not protocol target identities.
 
 use crate::{
 	std::{collections::BTreeMap, vec::Vec},
-	view::{BlockRef, ConsensusTarget, TargetId, TargetKind, TargetRef, View},
+	view::{BlockRef, TargetKind},
 	Chain, Error, VoteTarget,
 };
 use core::fmt;
 use num::{CheckedAdd, One};
-use parity_scale_codec::Encode;
+
+pub(crate) type TargetId = u64;
+pub(crate) type View = u64;
+pub(crate) type TargetRef = crate::view::TargetRef<TargetId, View>;
+pub(crate) type ConsensusTarget<H, N> = crate::view::ConsensusTarget<TargetId, View, H, N>;
 
 #[derive(Clone, Debug)]
 struct Entry<H, N> {
@@ -42,7 +47,6 @@ pub(crate) struct Finalization<H, N> {
 /// consensus-parent commitments and timeout eligibility before importing.
 #[derive(Clone, Debug)]
 pub(crate) struct ViewChain<H, N> {
-	domain: [u8; 32],
 	entries: BTreeMap<TargetId, Entry<H, N>>,
 	root: TargetRef,
 	finalized: TargetRef,
@@ -50,38 +54,30 @@ pub(crate) struct ViewChain<H, N> {
 
 impl<H, N> ViewChain<H, N>
 where
-	H: Clone + Ord + Encode,
-	N: Clone + Ord + Encode + CheckedAdd + One,
+	H: Clone + Ord,
+	N: Clone + Ord + CheckedAdd + One,
 {
 	/// Start at a trusted checkpoint and its latest finalized real block.
 	///
 	/// `root_view` need not equal `root.number`; views can have been skipped
 	/// before the checkpoint. The checkpoint is considered finalized.
 	///
-	/// All peers must agree on this root checkpoint and its identity. Calling
-	/// `new` at a later block or timeout synthesizes a new parentless identity;
-	/// it does not preserve the original target ID. Recovery must restore the
-	/// original root and target ancestry before applying the saved finality.
-	pub fn new(domain: [u8; 32], root_view: View, root: BlockRef<H, N>) -> Self {
+	/// The root receives ID 1; later imports receive successive IDs.
+	pub fn new(root_view: View, root: BlockRef<H, N>) -> Self {
 		let target = ConsensusTarget {
 			parent: None,
 			view: root_view,
 			kind: TargetKind::Block(root.clone()),
 		};
-		let root_ref = TargetRef { id: target.id(&domain), view: root_view };
+		let root_ref = TargetRef { id: 1, view: root_view };
 		let mut entries = BTreeMap::new();
 		entries.insert(root_ref.id, Entry { target, latest_block: root });
-		Self { domain, entries, root: root_ref, finalized: root_ref }
+		Self { entries, root: root_ref, finalized: root_ref }
 	}
 
 	/// The trusted root checkpoint.
 	pub fn root(&self) -> TargetRef {
 		self.root
-	}
-
-	/// The chain-specific domain used to compute all consensus target IDs.
-	pub fn domain(&self) -> &[u8; 32] {
-		&self.domain
 	}
 
 	/// The current finalized consensus target, including finalized timeouts.
@@ -144,20 +140,16 @@ where
 	/// conflicting with finality are rejected. Existing identical targets are
 	/// accepted idempotently, even if retained solely for historical proofs.
 	pub fn import(&mut self, target: ConsensusTarget<H, N>) -> Result<TargetRef, ViewError> {
-		let id = target.id(&self.domain);
-		let target_ref = TargetRef { id, view: target.view };
-		if let Some(existing) = self.entries.get(&id) {
-			return if existing.target == target {
-				Ok(target_ref)
-			} else {
-				Err(ViewError::TargetCollision)
-			};
+		if let Some((&id, _)) = self.entries.iter().find(|(_, entry)| entry.target == target) {
+			return Ok(TargetRef { id, view: target.view });
 		}
 		let latest_block = self.validate_child(&target)?;
 		let parent = target.parent.ok_or(ViewError::InvalidRoot)?;
 		if !self.descends_from(self.finalized.id, parent) {
 			return Err(ViewError::ConflictingFinality);
 		}
+		let id = self.entries.len() as TargetId + 1;
+		let target_ref = TargetRef { id, view: target.view };
 		self.entries.insert(id, Entry { target, latest_block });
 		Ok(target_ref)
 	}
@@ -257,8 +249,8 @@ where
 
 impl<H, N> Chain<TargetId, View> for ViewChain<H, N>
 where
-	H: Clone + Ord + Encode,
-	N: Clone + Ord + Encode + CheckedAdd + One,
+	H: Clone + Ord,
+	N: Clone + Ord + CheckedAdd + One,
 {
 	fn vote_target(&self, hash: TargetId) -> Option<VoteTarget<TargetId, View>> {
 		self.target(hash).map(|target| match &target.kind {
@@ -299,7 +291,6 @@ pub(crate) enum ViewError {
 	ViewOverflow,
 	BlockNumberOverflow,
 	InvalidRoot,
-	TargetCollision,
 }
 
 impl fmt::Display for ViewError {
@@ -312,7 +303,6 @@ impl fmt::Display for ViewError {
 			Self::ViewOverflow => "consensus view overflow",
 			Self::BlockNumberOverflow => "real block number overflow",
 			Self::InvalidRoot => "invalid consensus root",
-			Self::TargetCollision => "consensus target identity collision",
 		})
 	}
 }

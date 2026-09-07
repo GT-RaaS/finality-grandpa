@@ -8,13 +8,16 @@
 目标之间具有单父节点的祖先关系；由业务侧存储，并通过已有 `Chain` 接口提供：
 
 ```rust
-ConsensusTarget {
-    parent: Option<TargetId>, // 只有约定的根目标为 None
-    view: u64,
-    kind: TargetKind::Block(BlockRef { hash, number }),
-    // 或 TargetKind::ViewTimeout
+struct ConsensusTarget<I, V, H, N> {
+    parent: Option<I>, // 只有约定的根目标为 None
+    view: V,
+    kind: TargetKind<H, N>, // Block(BlockRef { hash, number }) 或 ViewTimeout
 }
 ```
+
+`I`、`V` 分别是业务侧提供的目标 ID 类型和 view 类型；
+`H`、`N` 分别是真实区块的 hash 类型和 number 类型。
+目标引用为 `TargetRef<I, V> { id, view }`。
 
 - Block：view +1，真实 block number +1。
 - Timeout：view +1，继承父节点最后一个真实区块。
@@ -24,7 +27,8 @@ ConsensusTarget {
 例如 `Block(v1,n1) -> Timeout(v2) -> Timeout(v3) -> Block(v4,n2)`：
 共识高度是 1、2、3、4，真实块高度是 1、1、1、2。祖先关系必须包含中间的 Timeout。
 
-`TargetId` 根据链域以及目标的 parent、view、类型和 payload 确定性计算。
+目标 ID 由业务侧提供，本库不规定 ID 的计算方式或哈希算法。
+业务侧必须保证不同共识目标有不同 ID，且参与节点对 ID 对应的目标达成一致。
 Timeout 不能复用上一个真实区块的 hash，否则会合并不同的投票对象。
 
 ## 核心接口
@@ -41,7 +45,8 @@ enum VoteTarget<H, N> {
 - `Environment::BestChain` 返回 `Result<Option<VoteTarget<H,N>>, Error>`。
 - 原 `Environment::finalize_block` 改为 `finalize_target`，接收共识目标及其证明。
 
-使用这些目标类型时，Voter/Round/VoteGraph 的 `H = TargetId`、`N = View = u64`。
+使用这些目标类型时，Voter/Round/VoteGraph 的 `H = I`、`N = V`。
+`V` 需满足原有核心的 `BlockNumberOps` 等约束，不固定为 `u64`。
 原有消息字段 `target_hash` 表示目标身份，`target_number` 表示 **view**；
 真实区块 hash/number 保存在 Block payload 中。
 

@@ -66,7 +66,7 @@ As well as callbacks for notifying about block finality and voter misbehavior (e
 ### Block and view-timeout targets
 
 The voter directly accepts `VoteTarget::Block` and `VoteTarget::ViewTimeout` from
-`Environment::best_chain_containing`. Instantiate the core over `(view::TargetId, view::View)`:
+`Environment::best_chain_containing`. Instantiate the core over the host's target ID and view types:
 both target kinds advance the consensus view by one; only blocks advance the real block number.
 `Chain::vote_target` supplies authenticated metadata and `Environment::finalize_target` persists
 consensus finality, including timeout-only progress. There is no feature gate or adapter layer.
@@ -76,14 +76,16 @@ networks. The host still provides block/header validation, timeout admission, si
 networking, fork choice and storage. See [the integration guide](docs/view-consensus.md).
 
 The library defines target data and consumes the host's `Chain` implementation; it does not
-provide an in-memory target store. The mock chain is defined only in the test module.
+provide an in-memory target store or compute target IDs. `ConsensusTarget<I, V, H, N>` and
+`TargetRef<I, V>` use host-defined target ID (`I`) and view (`V`) types; real block hashes (`H`)
+and numbers (`N`) remain separate. The mock chain is defined only in the test module.
 
 ```sh
 cargo test --all-features
 cargo check --no-default-features
 ```
 
-For encoded core votes/commits/catch-ups additionally enable `derive-codec`.
+For encoded targets, votes, commits and catch-ups additionally enable `derive-codec`.
 
 ### Substrate
 
